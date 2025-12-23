@@ -54,7 +54,12 @@ A private, local AI assistant using Ollama that runs entirely on your computer a
 
 2. Run Hidebar:
    ```bash
-   python Hidebar.py
+   # Option 1: Use the start script (recommended - handles venv automatically)
+   ./start.sh
+   
+   # Option 2: Manual run (make sure you're not in a virtual environment)
+   deactivate  # if in venv
+   python3 Hidebar.py
    ```
 
 3. The application will:
