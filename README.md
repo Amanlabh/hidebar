@@ -102,6 +102,16 @@ If the window still appears in screen sharing, you may need to:
 
 ## Troubleshooting
 
+### "ModuleNotFoundError: No module named '_tkinter'"
+- This happens when using a virtual environment with Homebrew Python
+- **Solution**: Deactivate the virtual environment first:
+  ```bash
+  deactivate
+  python3 Hidebar.py
+  ```
+- Or use the provided run script: `./run.sh`
+- The system Python (not Homebrew Python) includes tkinter by default
+
 ### "Cannot connect to Ollama"
 - Make sure Ollama is running: `ollama serve`
 - Check that Ollama is running on the default port (11434)
