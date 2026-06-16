@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Hidebar - A private local AI assistant using Ollama
-Hidden from screen sharing and runs entirely on your local machine
+Hidebar - An AI assistant powered by the Google Gemini API
+Hidden from screen sharing
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import scrolledtext, messagebox, ttk, simpledialog
 import requests
 import json
 import threading
@@ -31,7 +31,7 @@ class HidebarApp:
         self.root = root
         self.root.title("Hidebar")
         self.root.geometry("800x600")
-        
+
         # Make window always on top and transparent
         self.root.attributes('-topmost', True)  # Always on top - pinned
         self.root.attributes('-alpha', 0.75)  # More transparent (0.0 = fully transparent, 1.0 = opaque)
@@ -50,10 +50,32 @@ class HidebarApp:
         # Hide from screen sharing (macOS specific)
         self.setup_privacy()
         
-        # Ollama configuration
-        self.ollama_url = "http://localhost:11434"
-        self.model = "llama3.2:latest"  # Default model, can be changed
+        # Gemini configuration
+        # Key resolution order: env var -> saved config file -> empty (prompt user)
+        self.config_path = os.path.join(os.path.expanduser("~"), ".hidebar", "config.json")
+        self.gemini_api_key = os.environ.get("GEMINI_API_KEY") or self.load_config().get("api_key", "")
+        self.gemini_url = "https://generativelanguage.googleapis.com/v1beta"
+        self.model = "gemini-flash-latest"  # Default model, can be changed
+        self.available_gemini_models = [
+            "gemini-flash-latest",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-flash-lite-latest",
+            "gemini-pro-latest",
+        ]
         self.conversation_history = []
+        # Speed: keep-alive connection pool (skips TLS handshake per request)
+        self.session = requests.Session()
+        # New-style AQ.* keys authenticate via header, not ?key= query param
+        if self.gemini_api_key:
+            self.session.headers.update({"X-goog-api-key": self.gemini_api_key})
+        # Speed: only send the last N turns as context (fewer input tokens)
+        self.max_history_messages = 12
+        # Concise system instruction = shorter, faster generations
+        self.system_instruction = (
+            "You are Hidebar, a fast assistant. Answer directly and concisely. "
+            "Skip preamble and filler. Use short paragraphs or bullet points."
+        )
         self.streaming_message_start = None
         
         # Voice recognition setup
@@ -61,103 +83,78 @@ class HidebarApp:
         self.recognizer = None
         self.microphone = None
         self.tts_engine = None
+        self.audio_devices = []          # list of (index, name)
+        self.input_device_index = None   # selected capture device
+        self.bg_listener_stop = None     # stopper from listen_in_background
+        # Loopback drivers that expose system audio as an input device
+        self.loopback_keywords = ("blackhole", "loopback", "soundflower", "aggregate", "multi-output")
         self.setup_voice()
         
         # Setup UI
         self.setup_ui()
-        
+
+        # Global shortcut: Cmd+D (mac) / Ctrl+D (win/linux) toggles the mic
+        self.root.bind_all("<Command-d>", self.toggle_voice_shortcut)
+        self.root.bind_all("<Control-d>", self.toggle_voice_shortcut)
+
         # Keep window on top periodically
         self.keep_on_top()
         
-        # Check Ollama connection
-        self.check_ollama_connection()
-    
+        # Check Gemini connection (or prompt for a key on first run)
+        if self.gemini_api_key:
+            self.check_gemini_connection()
+        else:
+            self.root.after(600, self.prompt_for_key)
+
     def setup_multi_space(self):
-        """Setup window to appear on all spaces and screens"""
+        """Pin the window to every space and above fullscreen apps (macOS)."""
         try:
-            import subprocess
-            import threading
-            
-            def set_space_behavior():
-                """Set window to appear on all spaces"""
-                window_title = self.root.title()
-                pid = os.getpid()
-                
-                # Wait for window to be fully created
-                import time
-                time.sleep(0.5)
-                
-                # AppleScript to set window collection behavior
-                applescript = f'''
-                tell application "System Events"
-                    set targetProcs to (every process whose unix id is {pid})
-                    repeat with appProc in targetProcs
-                        try
-                            set windowList to (every window of appProc whose name contains "{window_title}")
-                            repeat with aWindow in windowList
-                                try
-                                    -- Set window to appear on all spaces
-                                    set value of attribute "AXFullScreen" of aWindow to false
-                                    -- Make it visible on all spaces
-                                    set value of attribute "AXMinimized" of aWindow to false
-                                end try
-                            end repeat
-                        end try
-                    end repeat
-                end tell
-                '''
-                
-                subprocess.run(
-                    ['osascript', '-e', applescript],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=2
-                )
-                
-                # Try using pyobjc for more reliable multi-space support
-                try:
-                    import objc
-                    from AppKit import NSWindow, NSWindowCollectionBehavior
-                    from Cocoa import NSWindowCollectionBehaviorCanJoinAllSpaces
-                    
-                    def set_collection_behavior():
-                        app = objc.objc_getClass('NSApplication').sharedApplication()
-                        windows = app.windows()
-                        for window in windows:
-                            if window.title() == window_title:
-                                # Make window appear on all spaces
-                                behavior = window.collectionBehavior()
-                                behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces
-                                window.setCollectionBehavior_(behavior)
-                                # Keep it on top
-                                window.setLevel_(NSWindow.NSFloatingWindowLevel)
-                                break
-                    
-                    # Run on main thread
-                    self.root.after(500, set_collection_behavior)
-                except (ImportError, AttributeError):
-                    pass
-            
-            # Run in background thread
-            threading.Thread(target=set_space_behavior, daemon=True).start()
-            
+            from AppKit import (
+                NSApplication,
+                NSWindowCollectionBehaviorCanJoinAllSpaces,
+                NSWindowCollectionBehaviorFullScreenAuxiliary,
+                NSWindowCollectionBehaviorStationary,
+                NSScreenSaverWindowLevel,
+            )
         except Exception as e:
-            print(f"Multi-space setup note: {e}")
+            print(f"Multi-space setup note (pyobjc unavailable): {e}")
+            return
+
+        # Combined behavior: show on all spaces, overlay fullscreen apps,
+        # and don't get swept up by Mission Control.
+        all_spaces_behavior = (
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorStationary
+        )
+
+        def pin_window():
+            """Re-apply pinning every cycle (runs on the main thread)."""
+            try:
+                app = NSApplication.sharedApplication()
+                for window in app.windows():
+                    window.setCollectionBehavior_(all_spaces_behavior)
+                    # Screen-saver level floats above fullscreen apps
+                    window.setLevel_(NSScreenSaverWindowLevel)
+            except Exception as e:
+                print(f"[pin] error: {e}")
+            # Re-apply often so it wins over any Tk reorder / space swipe
+            self.root.after(700, pin_window)
+
+        # Schedule on the main thread once the NSWindow exists
+        self.root.after(400, pin_window)
     
     def keep_on_top(self):
-        """Periodically ensure window stays on top across all screens"""
-        self.root.attributes('-topmost', True)
-        self.root.lift()
-        
-        # Also ensure it's visible on current screen
-        if sys.platform == "darwin":
-            try:
-                # Keep window on top and ensure it's on the active screen
-                self.root.update_idletasks()
-            except:
-                pass
-        
-        # Check every 2 seconds to ensure it stays on top
+        """Keep the window visible on top.
+
+        On macOS, leveling is owned by pin_window (pyobjc screen-saver level) so
+        the window floats above fullscreen apps. Do NOT re-assert Tk -topmost
+        here — that resets the NSWindow to floating level (below fullscreen).
+        """
+        if sys.platform != "darwin":
+            # Non-mac: Tk -topmost is the mechanism
+            self.root.attributes('-topmost', True)
+            self.root.lift()
         self.root.after(2000, self.keep_on_top)
         
     def setup_privacy(self):
@@ -175,12 +172,14 @@ class HidebarApp:
         """Start a background thread that continuously hides the window from screen sharing"""
         import subprocess
         import threading
-        
+
+        # Capture title here (main thread) — Tk calls from a worker thread crash
+        window_title = self.root.title()
+
         def hide_window_loop():
             """Continuously hide the window from screen sharing using AppleScript only"""
-            window_title = self.root.title()
             pid = os.getpid()
-            
+
             while True:
                 try:
                     # Use AppleScript to set window sharing type (safe from background thread)
@@ -271,20 +270,50 @@ class HidebarApp:
         )
         title_label.pack(side=tk.LEFT)
         
-        # Subtitle
+        # Subtitle / model badge
         subtitle_label = tk.Label(
             title_container,
-            text="Private AI Assistant",
+            text="Powered by Gemini",
             font=("SF Pro Display", 10),
             bg="#161b22",
             fg="#8b949e"
         )
         subtitle_label.pack(side=tk.LEFT, padx=(10, 0))
         
+        # Audio source selector (microphone vs system-audio loopback)
+        source_frame = tk.Frame(header_content, bg="#161b22")
+        source_frame.pack(side=tk.RIGHT, padx=(0, 16))
+
+        tk.Label(
+            source_frame,
+            text="Listen:",
+            bg="#161b22",
+            fg="#8b949e",
+            font=("SF Pro Display", 10)
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.source_var = tk.StringVar()
+        self.source_dropdown = ttk.Combobox(
+            source_frame,
+            textvariable=self.source_var,
+            width=20,
+            state="readonly",
+            font=("SF Mono", 10)
+        )
+        device_labels = [f"{i}: {n}" for i, n in self.audio_devices] or ["default"]
+        self.source_dropdown.config(values=device_labels)
+        if self.input_device_index is not None:
+            self.source_var.set(f"{self.input_device_index}: "
+                                f"{dict(self.audio_devices).get(self.input_device_index, '')}")
+        else:
+            self.source_var.set(device_labels[0])
+        self.source_dropdown.pack(side=tk.LEFT)
+        self.source_dropdown.bind("<<ComboboxSelected>>", self.on_source_change)
+
         # Model selector with better styling
         model_frame = tk.Frame(header_content, bg="#161b22")
         model_frame.pack(side=tk.RIGHT)
-        
+
         tk.Label(
             model_frame,
             text="Model:",
@@ -369,41 +398,78 @@ class HidebarApp:
         button_frame = tk.Frame(input_container, bg="#0d1117")
         button_frame.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Voice button with modern design
-        self.voice_button = tk.Button(
+        # Send button (primary accent)
+        self.send_button = tk.Button(
             button_frame,
-            text="🎤",
-            command=self.toggle_voice_listening,
-            bg="#238636" if not self.is_listening else "#da3633",
-            fg="#ffffff",
-            font=("SF Pro Display", 18),
-            relief=tk.FLAT,
-            padx=18,
-            pady=12,
-            cursor="hand2",
-            activebackground="#2ea043" if not self.is_listening else "#f85149",
-            activeforeground="#ffffff",
-            borderwidth=0
-        )
-        self.voice_button.pack(side=tk.TOP, pady=(0, 8))
-        
-        # Send button with modern design
-        send_button = tk.Button(
-            button_frame,
-            text="Send",
+            text="Send  ⏎",
             command=self.send_message,
-            bg="#238636",
+            bg="#1f6feb",
             fg="#ffffff",
             font=("SF Pro Display", 12, "bold"),
             relief=tk.FLAT,
             padx=24,
             pady=12,
             cursor="hand2",
-            activebackground="#2ea043",
+            activebackground="#388bfd",
             activeforeground="#ffffff",
             borderwidth=0
         )
-        send_button.pack(side=tk.TOP)
+        self.send_button.pack(side=tk.TOP, fill=tk.X)
+
+        # Secondary row: voice + clear
+        secondary_row = tk.Frame(button_frame, bg="#0d1117")
+        secondary_row.pack(side=tk.TOP, pady=(8, 0), fill=tk.X)
+
+        self.voice_button = tk.Button(
+            secondary_row,
+            text="🎤",
+            command=self.toggle_voice_listening,
+            bg="#21262d",
+            fg="#ffffff",
+            font=("SF Pro Display", 14),
+            relief=tk.FLAT,
+            padx=14,
+            pady=8,
+            cursor="hand2",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            borderwidth=0
+        )
+        self.voice_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+
+        clear_button = tk.Button(
+            secondary_row,
+            text="🗑",
+            command=self.clear_chat,
+            bg="#21262d",
+            fg="#ffffff",
+            font=("SF Pro Display", 14),
+            relief=tk.FLAT,
+            padx=14,
+            pady=8,
+            cursor="hand2",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            borderwidth=0
+        )
+        clear_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 4))
+
+        key_button = tk.Button(
+            secondary_row,
+            text="🔑",
+            command=lambda: self.prompt_for_key(force=True),
+            bg="#21262d",
+            fg="#ffffff",
+            font=("SF Pro Display", 14),
+            relief=tk.FLAT,
+            padx=14,
+            pady=8,
+            cursor="hand2",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            borderwidth=0
+        )
+        key_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
         
         # Status bar with modern styling
         status_container = tk.Frame(main_frame, bg="#0d1117")
@@ -420,7 +486,8 @@ class HidebarApp:
         self.status_bar.pack(side=tk.LEFT)
         
         # Welcome message
-        self.add_message("system", "👋 Welcome to Hidebar! Your private local AI assistant.\n\n💡 You can type messages or use the microphone button to speak.\n\n🔒 All processing happens locally on your machine.")
+        mic_key = "⌘D" if sys.platform == "darwin" else "Ctrl+D"
+        self.add_message("system", f"👋 Hidebar — fast AI assistant powered by Gemini.\n\n💡 Type, click 🎤, or press {mic_key} to toggle the mic. Enter sends, Shift+Enter = newline.\n\n🫥 Hidden from screen sharing.")
     
     def on_enter_pressed(self, event):
         """Handle Enter key press"""
@@ -434,31 +501,123 @@ class HidebarApp:
         self.model = self.model_var.get()
         self.update_status(f"Model changed to: {self.model}")
         self.load_available_models()
+
+    def clear_chat(self):
+        """Reset the conversation and clear the display"""
+        self.conversation_history = []
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.delete("1.0", tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+        self.add_message("system", "🧹 Conversation cleared.")
+        self.update_status("Ready")
     
-    def check_ollama_connection(self):
-        """Check if Ollama is running and get available models"""
-        self.update_status("Checking Ollama connection...")
-        threading.Thread(target=self.load_available_models, daemon=True).start()
-    
-    def load_available_models(self):
-        """Load available models from Ollama"""
+    def on_source_change(self, event=None):
+        """Switch the audio capture device; rebuild mic and restart if listening."""
+        if not SPEECH_RECOGNITION_AVAILABLE or not self.recognizer:
+            return
+        was_listening = self.is_listening
+        if was_listening:
+            self.stop_listening()
         try:
-            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            label = self.source_var.get()
+            idx = int(label.split(":", 1)[0]) if ":" in label else None
+        except Exception:
+            idx = None
+        self.input_device_index = idx
+        try:
+            self.microphone = sr.Microphone(device_index=idx)
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            self.update_status(f"Audio source set to: {self.source_var.get()}")
+        except Exception as e:
+            self.update_status(f"Source error: {str(e)[:40]}")
+            return
+        if was_listening:
+            self.start_listening()
+
+    def load_config(self):
+        """Load saved settings (e.g. API key) from the user's home dir."""
+        try:
+            with open(self.config_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_config(self, data):
+        """Merge and persist settings to ~/.hidebar/config.json."""
+        try:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            cfg = self.load_config()
+            cfg.update(data)
+            with open(self.config_path, "w") as f:
+                json.dump(cfg, f)
+            return True
+        except Exception as e:
+            print(f"Config save error: {e}")
+            return False
+
+    def prompt_for_key(self, force=False):
+        """Ask the user for their Gemini API key and save it."""
+        if self.gemini_api_key and not force:
+            return
+        key = simpledialog.askstring(
+            "Gemini API Key",
+            "Enter your Google Gemini API key.\n"
+            "Get a free key at: https://aistudio.google.com/apikey",
+            parent=self.root,
+            show="•",
+            initialvalue=self.gemini_api_key,
+        )
+        if key:
+            key = key.strip()
+            self.gemini_api_key = key
+            self.session.headers.update({"X-goog-api-key": key})
+            self.save_config({"api_key": key})
+            self.update_status("API key saved")
+            self.check_gemini_connection()
+        elif not self.gemini_api_key:
+            self.update_status("No API key — click 🔑 to add one")
+
+    def check_gemini_connection(self):
+        """Check if Gemini API is reachable and list available models"""
+        if not self.gemini_api_key:
+            self.update_status("No API key — click 🔑 to add one")
+            return
+        self.update_status("Checking Gemini connection...")
+        threading.Thread(target=self.load_available_models, daemon=True).start()
+
+    def load_available_models(self):
+        """Load available models from Gemini API"""
+        if not self.gemini_api_key:
+            self.root.after(0, lambda: self.update_status("No GEMINI_API_KEY set"))
+            return
+        try:
+            response = self.session.get(
+                f"{self.gemini_url}/models",
+                timeout=10,
+            )
             if response.status_code == 200:
-                models_data = response.json()
-                models = [model["name"] for model in models_data.get("models", [])]
-                if models:
-                    self.root.after(0, lambda: self.model_dropdown.config(values=models))
-                    if self.model not in models and models:
-                        self.model = models[0]
-                        self.root.after(0, lambda: self.model_var.set(self.model))
-                    self.root.after(0, lambda: self.update_status("Connected to Ollama"))
-                else:
-                    self.root.after(0, lambda: self.update_status("No models found. Please pull a model first."))
+                data = response.json()
+                models = [
+                    m["name"].replace("models/", "")
+                    for m in data.get("models", [])
+                    if "generateContent" in m.get("supportedGenerationMethods", [])
+                ]
+                if not models:
+                    models = self.available_gemini_models
+                self.root.after(0, lambda: self.model_dropdown.config(values=models))
+                if self.model not in models:
+                    self.model = models[0]
+                    self.root.after(0, lambda: self.model_var.set(self.model))
+                self.root.after(0, lambda: self.update_status("Connected to Gemini"))
+            elif response.status_code in (401, 403):
+                self.root.after(0, lambda: self.model_dropdown.config(values=self.available_gemini_models))
+                self.root.after(0, lambda: self.update_status("Invalid Gemini API key"))
             else:
-                self.root.after(0, lambda: self.update_status("Ollama returned an error"))
+                self.root.after(0, lambda: self.model_dropdown.config(values=self.available_gemini_models))
+                self.root.after(0, lambda: self.update_status(f"Gemini returned {response.status_code}"))
         except requests.exceptions.ConnectionError:
-            self.root.after(0, lambda: self.update_status("Cannot connect to Ollama. Make sure it's running on localhost:11434"))
+            self.root.after(0, lambda: self.update_status("Cannot reach Gemini API. Check your internet."))
         except Exception as e:
             self.root.after(0, lambda: self.update_status(f"Error: {str(e)}"))
     
@@ -489,7 +648,7 @@ class HidebarApp:
         self.chat_display.see(tk.END)
     
     def send_message(self):
-        """Send message to Ollama"""
+        """Send message to Gemini"""
         message = self.input_field.get("1.0", tk.END).strip()
         if not message:
             return
@@ -503,51 +662,86 @@ class HidebarApp:
         # Add to conversation history
         self.conversation_history.append({"role": "user", "content": message})
         
-        # Update status
-        self.update_status("Thinking...")
-        
-        # Send to Ollama in a separate thread
-        threading.Thread(target=self.get_ollama_response, args=(message,), daemon=True).start()
-    
-    def get_ollama_response(self, user_message):
-        """Get response from Ollama API with streaming"""
+        # Update status + lock send button to avoid overlapping requests
+        self.update_status("Thinking…")
+        self.set_busy(True)
+
+        # Send to Gemini in a separate thread
+        threading.Thread(target=self.get_gemini_response, args=(message,), daemon=True).start()
+
+    def set_busy(self, busy):
+        """Enable/disable the Send button while a request is in flight"""
+        state = tk.DISABLED if busy else tk.NORMAL
+        text = "…" if busy else "Send  ⏎"
+        self.send_button.config(state=state, text=text)
+
+    def get_gemini_response(self, user_message):
+        """Get response from Gemini API with streaming (SSE)"""
         try:
-            # Prepare the request with streaming enabled
+            if not self.gemini_api_key:
+                error_msg = "No GEMINI_API_KEY set"
+                self.root.after(0, lambda: self.update_status(error_msg))
+                self.root.after(0, lambda: self.add_message("system", error_msg))
+                return
+
+            # Convert conversation history to Gemini "contents" format.
+            # role "assistant" -> "model"; each message becomes parts[{text}].
+            # Only keep the last N messages to cut input tokens / latency.
+            recent = self.conversation_history[-self.max_history_messages:]
+            contents = []
+            for msg in recent:
+                role = "model" if msg["role"] == "assistant" else "user"
+                contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
             payload = {
-                "model": self.model,
-                "messages": self.conversation_history,
-                "stream": True
+                "contents": contents,
+                "systemInstruction": {"parts": [{"text": self.system_instruction}]},
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 2048,
+                    # Disable "thinking" on 2.5 models -> big latency drop.
+                    # Ignored by models that don't support it.
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
             }
-            
-            # Make streaming request
-            response = requests.post(
-                f"{self.ollama_url}/api/chat",
+
+            # Make streaming request (Server-Sent Events) over keep-alive session
+            response = self.session.post(
+                f"{self.gemini_url}/models/{self.model}:streamGenerateContent",
+                params={"alt": "sse"},
                 json=payload,
                 stream=True,
                 timeout=300
             )
-            
+
             if response.status_code == 200:
                 # Start streaming the response
                 full_response = ""
                 self.root.after(0, lambda: self.start_streaming_message())
-                
+
                 for line in response.iter_lines():
-                    if line:
-                        try:
-                            json_data = json.loads(line.decode('utf-8'))
-                            content = json_data.get("message", {}).get("content", "")
-                            if content:
-                                full_response += content
-                                # Update UI with streaming content
-                                self.root.after(0, lambda c=content: self.append_to_streaming(c))
-                            
-                            # Check if done
-                            if json_data.get("done", False):
-                                break
-                        except json.JSONDecodeError:
+                    if not line:
+                        continue
+                    decoded = line.decode("utf-8")
+                    if not decoded.startswith("data:"):
+                        continue
+                    data_str = decoded[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        json_data = json.loads(data_str)
+                        candidates = json_data.get("candidates", [])
+                        if not candidates:
                             continue
-                
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        content = "".join(p.get("text", "") for p in parts)
+                        if content:
+                            full_response += content
+                            # Update UI with streaming content
+                            self.root.after(0, lambda c=content: self.append_to_streaming(c))
+                    except json.JSONDecodeError:
+                        continue
+
                 # Add complete message to history
                 if full_response:
                     self.conversation_history.append({"role": "assistant", "content": full_response})
@@ -562,13 +756,13 @@ class HidebarApp:
                 error_msg = f"Error: {response.status_code} - {response.text[:200]}"
                 self.root.after(0, lambda: self.update_status(error_msg))
                 self.root.after(0, lambda: self.add_message("system", error_msg))
-                
+
         except requests.exceptions.Timeout:
             error_msg = "Request timed out. The model might be too slow or not responding."
             self.root.after(0, lambda: self.update_status(error_msg))
             self.root.after(0, lambda: self.add_message("system", error_msg))
         except requests.exceptions.ConnectionError:
-            error_msg = "Cannot connect to Ollama. Make sure it's running."
+            error_msg = "Cannot reach Gemini API. Check your internet connection."
             self.root.after(0, lambda: self.update_status(error_msg))
             self.root.after(0, lambda: self.add_message("system", error_msg))
         except Exception as e:
@@ -577,7 +771,10 @@ class HidebarApp:
             self.root.after(0, lambda: self.add_message("system", error_msg))
             import traceback
             print(f"Full error: {traceback.format_exc()}")
-    
+        finally:
+            # Always unlock the Send button
+            self.root.after(0, lambda: self.set_busy(False))
+
     def start_streaming_message(self):
         """Start a new streaming message in the chat"""
         self.chat_display.config(state=tk.NORMAL)
@@ -613,25 +810,39 @@ class HidebarApp:
         """Update status bar"""
         self.status_bar.config(text=message)
     
+    def detect_devices(self):
+        """List input devices; prefer a loopback driver (system audio)."""
+        try:
+            names = sr.Microphone.list_microphone_names()
+        except Exception:
+            names = []
+        self.audio_devices = list(enumerate(names))
+        # Pick first loopback-style device if available, else system default
+        for idx, name in self.audio_devices:
+            if any(k in name.lower() for k in self.loopback_keywords):
+                return idx
+        return None
+
     def setup_voice(self):
         """Setup voice recognition and text-to-speech"""
         if SPEECH_RECOGNITION_AVAILABLE:
             try:
                 self.recognizer = sr.Recognizer()
-                self.microphone = sr.Microphone()
-                
-                # Better ambient noise adjustment
-                self.root.after(0, lambda: self.update_status("🎤 Calibrating microphone..."))
-                with self.microphone as source:
-                    # Longer calibration for better accuracy
-                    self.recognizer.adjust_for_ambient_noise(source, duration=1.5)
-                    # Set energy threshold dynamically
-                    self.recognizer.energy_threshold = self.recognizer.energy_threshold * 0.8
-                
-                # Configure recognizer for better accuracy
+                self.input_device_index = self.detect_devices()
+                self.microphone = sr.Microphone(device_index=self.input_device_index)
+
+                # Tuned for low latency + complete questions:
                 self.recognizer.dynamic_energy_threshold = True
-                self.recognizer.pause_threshold = 0.8  # Pause before considering phrase complete
-                
+                self.recognizer.pause_threshold = 0.6        # snappier end-of-phrase
+                self.recognizer.non_speaking_duration = 0.3
+                self.recognizer.phrase_threshold = 0.2
+
+                # Quick one-time calibration
+                self.root.after(0, lambda: self.update_status("🎤 Calibrating audio..."))
+                with self.microphone as source:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.6)
+                    self.recognizer.energy_threshold *= 0.8
+
                 self.root.after(0, lambda: self.update_status("Ready"))
             except Exception as e:
                 print(f"Voice recognition setup error: {e}")
@@ -653,6 +864,11 @@ class HidebarApp:
                 print(f"TTS setup error: {e}")
                 self.tts_engine = None
     
+    def toggle_voice_shortcut(self, event=None):
+        """Cmd+D / Ctrl+D handler — toggle mic, swallow default key action."""
+        self.toggle_voice_listening()
+        return "break"
+
     def toggle_voice_listening(self):
         """Toggle voice listening on/off"""
         if not SPEECH_RECOGNITION_AVAILABLE or not self.recognizer:
@@ -682,111 +898,50 @@ class HidebarApp:
             bg="#da3633",
             activebackground="#f85149"
         )
-        self.update_status("🎤 Listening... Speak clearly")
-        
-        # Recalibrate for current environment
+        src = "system audio" if self.input_device_index is not None and \
+            any(k in dict(self.audio_devices).get(self.input_device_index, "").lower()
+                for k in self.loopback_keywords) else "microphone"
+        self.update_status(f"🎤 Listening to {src}…")
+
+        # Persistent background stream: low latency, non-blocking, no per-phrase
+        # stream reopen. Recognition runs in the library's worker thread.
+        self.bg_listener_stop = self.recognizer.listen_in_background(
+            self.microphone,
+            self._on_audio,
+            phrase_time_limit=15,
+        )
+
+    def _on_audio(self, recognizer, audio):
+        """Background callback: transcribe captured audio, then answer it."""
+        if not self.is_listening:
+            return
         try:
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.8)
-        except:
-            pass
-        
-        # Start listening in a separate thread
-        threading.Thread(target=self.listen_continuously, daemon=True).start()
-    
+            text = recognizer.recognize_google(audio, language="en-US")
+        except sr.UnknownValueError:
+            return  # unintelligible — ignore
+        except sr.RequestError as e:
+            self.root.after(0, lambda: self.update_status(f"Speech API error: {str(e)[:40]}"))
+            return
+        except Exception:
+            return
+        if text and text.strip():
+            self.root.after(0, lambda t=text: self.process_voice_input(t))
+
     def stop_listening(self):
         """Stop voice listening"""
         self.is_listening = False
+        if self.bg_listener_stop:
+            try:
+                self.bg_listener_stop(wait_for_stop=False)
+            except Exception:
+                pass
+            self.bg_listener_stop = None
         self.voice_button.config(
             text="🎤",
-            bg="#34C759",
-            activebackground="#28A745"
+            bg="#21262d",
+            activebackground="#30363d"
         )
         self.update_status("Voice listening stopped")
-    
-    def listen_continuously(self):
-        """Continuously listen for voice input with improved accuracy"""
-        consecutive_errors = 0
-        max_errors = 5
-        
-        while self.is_listening:
-            try:
-                with self.microphone as source:
-                    # Improved listening parameters
-                    # Longer timeout to catch speech better
-                    # Longer phrase_time_limit to capture complete sentences
-                    audio = self.recognizer.listen(
-                        source, 
-                        timeout=2,  # Increased from 1 to 2 seconds
-                        phrase_time_limit=10  # Increased from 5 to 10 seconds for longer phrases
-                    )
-                
-                # Update status to show processing
-                self.root.after(0, lambda: self.update_status("🔍 Processing speech..."))
-                
-                try:
-                    # Try Google's speech recognition first (most accurate)
-                    text = self.recognizer.recognize_google(audio, language='en-US')
-                    
-                    if text and len(text.strip()) > 0:
-                        # Reset error counter on success
-                        consecutive_errors = 0
-                        
-                        # Add to input field and send
-                        self.root.after(0, lambda t=text: self.process_voice_input(t))
-                        
-                        # Brief pause before listening again
-                        import time
-                        time.sleep(0.3)
-                        
-                except sr.UnknownValueError:
-                    # Could not understand audio - this is normal, just continue
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_errors:
-                        self.root.after(0, lambda: self.update_status("🎤 Listening... (speak louder or clearer)"))
-                        consecutive_errors = 0
-                    continue
-                    
-                except sr.RequestError as e:
-                    # Network or API error
-                    consecutive_errors += 1
-                    error_msg = f"Speech API error: {str(e)[:50]}"
-                    self.root.after(0, lambda: self.update_status(error_msg))
-                    
-                    if consecutive_errors >= max_errors:
-                        self.root.after(0, lambda: self.update_status("🎤 Listening... (check internet connection)"))
-                        consecutive_errors = 0
-                    
-                    # Wait a bit before retrying
-                    import time
-                    time.sleep(1)
-                    continue
-                    
-            except sr.WaitTimeoutError:
-                # Timeout - this is normal, just continue listening
-                continue
-                
-            except Exception as e:
-                if self.is_listening:
-                    consecutive_errors += 1
-                    error_msg = f"Error: {str(e)[:40]}"
-                    self.root.after(0, lambda: self.update_status(error_msg))
-                    
-                    if consecutive_errors >= max_errors:
-                        # Too many errors, try to recalibrate
-                        try:
-                            with self.microphone as source:
-                                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                            consecutive_errors = 0
-                            self.root.after(0, lambda: self.update_status("🎤 Recalibrated - Listening..."))
-                        except:
-                            pass
-                    
-                    # Wait before retrying
-                    import time
-                    time.sleep(0.5)
-                else:
-                    break
     
     def process_voice_input(self, text):
         """Process voice input and send to chat"""
